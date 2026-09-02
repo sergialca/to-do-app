@@ -1,17 +1,24 @@
 import DateTimePicker, {
   type DateTimePickerEvent,
 } from '@react-native-community/datetimepicker';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
+  ActivityIndicator,
+  FlatList,
   KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   TextInput,
   View,
 } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import Swipeable, {
+  SwipeDirection,
+} from 'react-native-gesture-handler/ReanimatedSwipeable';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
@@ -20,6 +27,17 @@ import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
 import { supabase } from '@/lib/supabase';
+
+type Task = {
+  id: string;
+  user_id: string;
+  title: string;
+  description: string | null;
+  is_completed: boolean;
+  due_date: string | null;
+  created_at: string;
+  updated_at: string;
+};
 
 function defaultDueDate() {
   const date = new Date();
@@ -35,15 +53,86 @@ function formatDueDate(date: Date) {
   });
 }
 
+function formatTaskDueDate(value: string | null) {
+  if (!value) return null;
+  return formatDueDate(new Date(value));
+}
+
 function toDateTimeLocalValue(date: Date) {
   const offset = date.getTimezoneOffset();
   const local = new Date(date.getTime() - offset * 60_000);
   return local.toISOString().slice(0, 16);
 }
 
+function TaskRow({
+  task,
+  onComplete,
+  onDelete,
+}: {
+  task: Task;
+  onComplete: (task: Task) => void;
+  onDelete: (task: Task) => void;
+}) {
+  const theme = useTheme();
+
+  return (
+    <Swipeable
+      friction={2}
+      overshootFriction={8}
+      renderLeftActions={() => (
+        <View style={[styles.swipeAction, styles.deleteAction]}>
+          <ThemedText style={styles.swipeActionLabel}>Delete</ThemedText>
+        </View>
+      )}
+      renderRightActions={() => (
+        <View style={[styles.swipeAction, styles.completeAction]}>
+          <ThemedText style={styles.swipeActionLabel}>
+            {task.is_completed ? 'Done' : 'Complete'}
+          </ThemedText>
+        </View>
+      )}
+      onSwipeableOpen={(direction) => {
+        if (direction === SwipeDirection.LEFT) {
+          // Swipe right → left actions → delete
+          onDelete(task);
+          return;
+        }
+
+        if (direction === SwipeDirection.RIGHT && !task.is_completed) {
+          // Swipe left → right actions → complete
+          onComplete(task);
+        }
+      }}>
+      <View style={[styles.taskCard, { backgroundColor: theme.backgroundElement }]}>
+        <ThemedText
+          style={[styles.taskTitle, task.is_completed && styles.taskTitleCompleted]}>
+          {task.title}
+        </ThemedText>
+        {task.description ? (
+          <ThemedText themeColor="textSecondary" style={styles.taskDescription}>
+            {task.description}
+          </ThemedText>
+        ) : null}
+        {task.due_date ? (
+          <ThemedText themeColor="textSecondary" type="small">
+            Due {formatTaskDueDate(task.due_date)}
+          </ThemedText>
+        ) : null}
+      </View>
+    </Swipeable>
+  );
+}
+
 export default function HomeScreen() {
   const theme = useTheme();
   const { session } = useAuth();
+  const userId = session?.user.id;
+
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [isLoadingTasks, setIsLoadingTasks] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [listError, setListError] = useState<string | null>(null);
+
   const [isFormVisible, setIsFormVisible] = useState(false);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -52,6 +141,42 @@ export default function HomeScreen() {
   const [showTimePicker, setShowTimePicker] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+
+  async function loadTasks(options?: { refresh?: boolean }) {
+    if (!userId) {
+      setTasks([]);
+      setIsLoadingTasks(false);
+      return;
+    }
+
+    if (options?.refresh) {
+      setIsRefreshing(true);
+    } else {
+      setIsLoadingTasks(true);
+    }
+
+    setListError(null);
+
+    const { data, error } = await supabase
+      .from('tasks')
+      .select('id, user_id, title, description, is_completed, due_date, created_at, updated_at')
+      .eq('user_id', userId)
+      .order('is_completed', { ascending: true })
+      .order('due_date', { ascending: true });
+
+    if (error) {
+      setListError(error.message);
+    } else {
+      setTasks((data as Task[]) ?? []);
+    }
+
+    setIsLoadingTasks(false);
+    setIsRefreshing(false);
+  }
+
+  useEffect(() => {
+    void loadTasks();
+  }, [userId]);
 
   function resetForm() {
     setTitle('');
@@ -76,7 +201,6 @@ export default function HomeScreen() {
   async function handleContinue() {
     const trimmedTitle = title.trim();
     const trimmedDescription = description.trim();
-    const userId = session?.user.id;
 
     if (!userId) {
       setFormError('You must be signed in to create a task.');
@@ -105,7 +229,6 @@ export default function HomeScreen() {
         throw new Error(error.message);
       }
 
-      // Keep a local copy of the payload that was saved.
       await fetch('/api/create-task-log', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -118,9 +241,47 @@ export default function HomeScreen() {
       });
 
       closeForm();
+      await loadTasks({ refresh: true });
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'Something went wrong.');
       setIsSubmitting(false);
+    }
+  }
+
+  async function completeTask(task: Task) {
+    setTasks((current) =>
+      current.map((item) =>
+        item.id === task.id ? { ...item, is_completed: true } : item
+      )
+    );
+
+    const { error } = await supabase
+      .from('tasks')
+      .update({
+        is_completed: true,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', task.id)
+      .eq('user_id', userId);
+
+    if (error) {
+      setListError(error.message);
+      await loadTasks({ refresh: true });
+    }
+  }
+
+  async function deleteTask(task: Task) {
+    setTasks((current) => current.filter((item) => item.id !== task.id));
+
+    const { error } = await supabase
+      .from('tasks')
+      .delete()
+      .eq('id', task.id)
+      .eq('user_id', userId);
+
+    if (error) {
+      setListError(error.message);
+      await loadTasks({ refresh: true });
     }
   }
 
@@ -166,98 +327,92 @@ export default function HomeScreen() {
   }
 
   return (
-    <ThemedView style={styles.container}>
-      <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
-        <ThemedText type="subtitle">Tasks</ThemedText>
-        <ThemedText themeColor="textSecondary">Your to-dos will show up here.</ThemedText>
-      </SafeAreaView>
+    <GestureHandlerRootView style={styles.container}>
+      <ThemedView style={styles.container}>
+        <SafeAreaView style={styles.safeArea} edges={['top', 'bottom']}>
+          <ThemedText type="subtitle">Tasks</ThemedText>
+          <ThemedText themeColor="textSecondary">
+            Swipe left to complete, right to delete.
+          </ThemedText>
 
-      <Pressable
-        accessibilityLabel="Add task"
-        accessibilityRole="button"
-        onPress={openForm}
-        style={({ pressed }) => [
-          styles.fab,
-          {
-            backgroundColor: theme.text,
-            opacity: pressed ? 0.8 : 1,
-            bottom: BottomTabInset + Spacing.four,
-          },
-        ]}>
-        <ThemedText style={[styles.fabLabel, { color: theme.background }]}>+</ThemedText>
-      </Pressable>
+          {listError ? (
+            <ThemedText themeColor="textSecondary">{listError}</ThemedText>
+          ) : null}
 
-      <Modal
-        animationType="slide"
-        onRequestClose={closeForm}
-        presentationStyle="pageSheet"
-        transparent={Platform.OS === 'android'}
-        visible={isFormVisible}>
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          style={[
-            styles.modalContainer,
-            Platform.OS === 'android' && styles.modalContainerAndroid,
+          {isLoadingTasks ? (
+            <View style={styles.centered}>
+              <ActivityIndicator color={theme.text} />
+            </View>
+          ) : (
+            <FlatList
+              data={tasks}
+              keyExtractor={(item) => item.id}
+              contentContainerStyle={styles.listContent}
+              showsVerticalScrollIndicator={false}
+              refreshControl={
+                <RefreshControl
+                  refreshing={isRefreshing}
+                  onRefresh={() => loadTasks({ refresh: true })}
+                  tintColor={theme.text}
+                />
+              }
+              ListEmptyComponent={
+                <ThemedText themeColor="textSecondary" style={styles.emptyText}>
+                  No tasks yet. Tap + to add one.
+                </ThemedText>
+              }
+              renderItem={({ item }) => (
+                <TaskRow task={item} onComplete={completeTask} onDelete={deleteTask} />
+              )}
+            />
+          )}
+        </SafeAreaView>
+
+        <Pressable
+          accessibilityLabel="Add task"
+          accessibilityRole="button"
+          onPress={openForm}
+          style={({ pressed }) => [
+            styles.fab,
+            {
+              backgroundColor: theme.text,
+              opacity: pressed ? 0.8 : 1,
+              bottom: BottomTabInset + Spacing.four,
+            },
           ]}>
-          <ThemedView style={styles.modalSheet}>
-            <SafeAreaView edges={['bottom']} style={styles.modalSafeArea}>
-              <View style={styles.modalHeader}>
-                <ThemedText type="subtitle">New task</ThemedText>
-                <Pressable accessibilityRole="button" hitSlop={8} onPress={closeForm}>
-                  <ThemedText type="linkPrimary">Cancel</ThemedText>
-                </Pressable>
-              </View>
+          <ThemedText style={[styles.fabLabel, { color: theme.background }]}>+</ThemedText>
+        </Pressable>
 
-              <ScrollView
-                contentContainerStyle={styles.modalContent}
-                keyboardShouldPersistTaps="handled">
-                <View style={styles.field}>
-                  <ThemedText themeColor="textSecondary">Title</ThemedText>
-                  <TextInput
-                    autoFocus
-                    onChangeText={setTitle}
-                    placeholder="What do you need to do?"
-                    placeholderTextColor={theme.textSecondary}
-                    style={[
-                      styles.input,
-                      {
-                        backgroundColor: theme.backgroundElement,
-                        color: theme.text,
-                      },
-                    ]}
-                    value={title}
-                  />
+        <Modal
+          animationType="slide"
+          onRequestClose={closeForm}
+          presentationStyle="pageSheet"
+          transparent={Platform.OS === 'android'}
+          visible={isFormVisible}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={[
+              styles.modalContainer,
+              Platform.OS === 'android' && styles.modalContainerAndroid,
+            ]}>
+            <ThemedView style={styles.modalSheet}>
+              <SafeAreaView edges={['bottom']} style={styles.modalSafeArea}>
+                <View style={styles.modalHeader}>
+                  <ThemedText type="subtitle">New task</ThemedText>
+                  <Pressable accessibilityRole="button" hitSlop={8} onPress={closeForm}>
+                    <ThemedText type="linkPrimary">Cancel</ThemedText>
+                  </Pressable>
                 </View>
 
-                <View style={styles.field}>
-                  <ThemedText themeColor="textSecondary">Description</ThemedText>
-                  <TextInput
-                    multiline
-                    onChangeText={setDescription}
-                    placeholder="Add more details"
-                    placeholderTextColor={theme.textSecondary}
-                    style={[
-                      styles.input,
-                      styles.descriptionInput,
-                      {
-                        backgroundColor: theme.backgroundElement,
-                        color: theme.text,
-                      },
-                    ]}
-                    textAlignVertical="top"
-                    value={description}
-                  />
-                </View>
-
-                <View style={styles.field}>
-                  <ThemedText themeColor="textSecondary">Due date</ThemedText>
-
-                  {Platform.OS === 'web' ? (
+                <ScrollView
+                  contentContainerStyle={styles.modalContent}
+                  keyboardShouldPersistTaps="handled">
+                  <View style={styles.field}>
+                    <ThemedText themeColor="textSecondary">Title</ThemedText>
                     <TextInput
-                      onChangeText={(value) => {
-                        if (!value) return;
-                        setDueDate(new Date(value));
-                      }}
+                      autoFocus
+                      onChangeText={setTitle}
+                      placeholder="What do you need to do?"
                       placeholderTextColor={theme.textSecondary}
                       style={[
                         styles.input,
@@ -266,68 +421,110 @@ export default function HomeScreen() {
                           color: theme.text,
                         },
                       ]}
-                      value={toDateTimeLocalValue(dueDate)}
-                      {...({ type: 'datetime-local' } as object)}
+                      value={title}
                     />
-                  ) : (
-                    <>
-                      <Pressable
-                        accessibilityRole="button"
-                        onPress={openDueDatePicker}
+                  </View>
+
+                  <View style={styles.field}>
+                    <ThemedText themeColor="textSecondary">Description</ThemedText>
+                    <TextInput
+                      multiline
+                      onChangeText={setDescription}
+                      placeholder="Add more details"
+                      placeholderTextColor={theme.textSecondary}
+                      style={[
+                        styles.input,
+                        styles.descriptionInput,
+                        {
+                          backgroundColor: theme.backgroundElement,
+                          color: theme.text,
+                        },
+                      ]}
+                      textAlignVertical="top"
+                      value={description}
+                    />
+                  </View>
+
+                  <View style={styles.field}>
+                    <ThemedText themeColor="textSecondary">Due date</ThemedText>
+
+                    {Platform.OS === 'web' ? (
+                      <TextInput
+                        onChangeText={(value) => {
+                          if (!value) return;
+                          setDueDate(new Date(value));
+                        }}
+                        placeholderTextColor={theme.textSecondary}
                         style={[
                           styles.input,
-                          styles.dueDateButton,
-                          { backgroundColor: theme.backgroundElement },
-                        ]}>
-                        <ThemedText>{formatDueDate(dueDate)}</ThemedText>
-                      </Pressable>
+                          {
+                            backgroundColor: theme.backgroundElement,
+                            color: theme.text,
+                          },
+                        ]}
+                        value={toDateTimeLocalValue(dueDate)}
+                        {...({ type: 'datetime-local' } as object)}
+                      />
+                    ) : (
+                      <>
+                        <Pressable
+                          accessibilityRole="button"
+                          onPress={openDueDatePicker}
+                          style={[
+                            styles.input,
+                            styles.dueDateButton,
+                            { backgroundColor: theme.backgroundElement },
+                          ]}>
+                          <ThemedText>{formatDueDate(dueDate)}</ThemedText>
+                        </Pressable>
 
-                      {showDatePicker ? (
-                        <DateTimePicker
-                          display={Platform.OS === 'ios' ? 'spinner' : 'default'}
-                          mode={Platform.OS === 'ios' ? 'datetime' : 'date'}
-                          onChange={onDateChange}
-                          value={dueDate}
-                        />
-                      ) : null}
+                        {showDatePicker ? (
+                          <DateTimePicker
+                            display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                            mode={Platform.OS === 'ios' ? 'datetime' : 'date'}
+                            onChange={onDateChange}
+                            value={dueDate}
+                          />
+                        ) : null}
 
-                      {showTimePicker ? (
-                        <DateTimePicker
-                          display="default"
-                          mode="time"
-                          onChange={onTimeChange}
-                          value={dueDate}
-                        />
-                      ) : null}
-                    </>
-                  )}
-                </View>
+                        {showTimePicker ? (
+                          <DateTimePicker
+                            display="default"
+                            mode="time"
+                            onChange={onTimeChange}
+                            value={dueDate}
+                          />
+                        ) : null}
+                      </>
+                    )}
+                  </View>
 
-                {formError ? (
-                  <ThemedText themeColor="textSecondary">{formError}</ThemedText>
-                ) : null}
+                  {formError ? (
+                    <ThemedText themeColor="textSecondary">{formError}</ThemedText>
+                  ) : null}
 
-                <Pressable
-                  accessibilityRole="button"
-                  disabled={isSubmitting}
-                  onPress={handleContinue}
-                  style={({ pressed }) => [
-                    styles.submitButton,
-                    {
-                      backgroundColor: theme.text,
-                      opacity: isSubmitting || pressed ? 0.7 : 1,
-                    },
-                  ]}>
-                  <ThemedText style={[styles.submitLabel, { color: theme.background }]}>
-                    {isSubmitting ? 'Saving…' : 'Continue'}
-                  </ThemedText>
-                </Pressable>
-              </ScrollView>
-            </SafeAreaView>
-          </ThemedView>
-        </KeyboardAvoidingView>
-      </Modal>
-    </ThemedView>
+                  <Pressable
+                    accessibilityRole="button"
+                    disabled={isSubmitting}
+                    onPress={handleContinue}
+                    style={({ pressed }) => [
+                      styles.submitButton,
+                      {
+                        backgroundColor: theme.text,
+                        opacity: isSubmitting || pressed ? 0.7 : 1,
+                      },
+                    ]}>
+                    <ThemedText style={[styles.submitLabel, { color: theme.background }]}>
+                      {isSubmitting ? 'Saving…' : 'Continue'}
+                    </ThemedText>
+                  </Pressable>
+                </ScrollView>
+              </SafeAreaView>
+            </ThemedView>
+          </KeyboardAvoidingView>
+        </Modal>
+      </ThemedView>
+    </GestureHandlerRootView>
   );
 }
 
@@ -343,6 +540,55 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.four,
     paddingBottom: BottomTabInset + Spacing.three,
     gap: Spacing.two,
+  },
+  centered: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  listContent: {
+    gap: Spacing.two,
+    paddingTop: Spacing.two,
+    paddingBottom: Spacing.six,
+    flexGrow: 1,
+  },
+  emptyText: {
+    marginTop: Spacing.four,
+  },
+  taskCard: {
+    borderRadius: Spacing.two,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.three,
+    gap: Spacing.one,
+  },
+  taskTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  taskTitleCompleted: {
+    textDecorationLine: 'line-through',
+    opacity: 0.6,
+  },
+  taskDescription: {
+    fontSize: 14,
+  },
+  swipeAction: {
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.four,
+    borderRadius: Spacing.two,
+    marginVertical: 0,
+  },
+  completeAction: {
+    backgroundColor: '#1F7A4D',
+    alignItems: 'flex-end',
+  },
+  deleteAction: {
+    backgroundColor: '#C0392B',
+    alignItems: 'flex-start',
+  },
+  swipeActionLabel: {
+    color: '#ffffff',
+    fontWeight: '700',
   },
   fab: {
     position: 'absolute',
