@@ -30,6 +30,12 @@ yarn-error.*
 .DS_Store
 *.pem
 
+#project environment files
+.env
+
+#indicate node to use pnpm
+.npmrc
+
 # local env files
 .env*.local
 
