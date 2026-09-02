@@ -1,0 +1,3 @@
+minimumReleaseAgeExclude:
+  - expo-asset@57.0.16
+  - expo-constants@57.0.17
